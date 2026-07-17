@@ -1,0 +1,985 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+% lmodern unavailable in this TeX install; disable microtype font expansion instead
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage[protrusion=true,expansion=false]{microtype}
+\usepackage[hidelinks]{hyperref}
+
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{blue!60!black},
+  commentstyle=\color{green!40!black}\itshape,
+  breaklines=true,
+  frame=single,
+  framesep=4pt,
+  showstringspaces=false,
+  columns=fullflexible,
+}
+
+\theoremstyle{plain}
+\newtheorem{proposition}{Proposition}
+\newtheorem{lemma}{Lemma}
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+\theoremstyle{remark}
+\newtheorem*{remark}{Remark}
+
+\newcommand{\FF}{\mathbb{F}}
+
+\title{\textbf{Concentric Cubes Are Plumbing, Not Security}\\[0.4em]
+\large Design and Cryptanalysis of \texttt{cube3d-sponge}, a Three-Dimensional\\
+Cellular-Automaton Sponge Permutation}
+
+\author{Wofl \\ \small whispr.dev \\ \small \texttt{<contact>}}
+
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+A recurring intuition in the cellular-automaton (CA) cryptography literature holds
+that adding spatial dimensions, neighbourhood radius, or nested structure to a CA
+makes the resulting cipher ``more complex and hence more secure.'' We take that
+intuition seriously enough to test it. Starting from a proposal to fold plaintext
+into a three-dimensional grid of concentric cubic shells and evolve a CA radiating
+outward from the centre, we show that the geometric intuition is \emph{orthogonal}
+to security: apparent complexity contributes nothing that is not already captured by
+nonlinearity, invertibility, symmetry-breaking, and diffusion uniformity. We then
+show that the concentric-shell geometry \emph{does} have one legitimate cryptographic
+role --- as a sponge rate/capacity boundary --- and build \texttt{cube3d-sponge}, an
+$8\times8\times8$ byte-state ($4096$-bit) permutation combining a checkerboard
+generalised Feistel network over a 3-torus, a $\chi$-family nonlinear map, a per-cell
+byte rotation, and a coordinate shear, wrapped in a sponge whose rate is the outer
+cubic shell and whose capacity is the inner shells.
+
+Our contribution is primarily \emph{negative and methodological}. We report a
+complete cryptanalytic ladder against the construction, obtained from four
+independent harnesses and cross-validated on two operating systems: key recovery by
+cube attack succeeds only to round~2 of~12; deterministic zero-sum distinguishers
+derived from provable degree upper bounds reach round~4 with practical cubes
+($2^{16}$) and round~5 with a $2^{64}$ cube; statistical differential bias is
+detectable to round~6. We document two design bugs the harnesses caught that would
+otherwise have produced confident nonsense --- a checkerboard 2-colouring that is
+inconsistent on an odd-length torus, and bitwise operations that left the eight
+bit-planes of the state \emph{provably non-interacting}, capping avalanche at exactly
+$512/2/4096 = 6.25\%$ --- and two harness bugs that produced impossible
+(non-monotonic) measurements before being fixed. We argue that the discipline of
+building the falsifier before trusting the design is the transferable result here,
+and we explicitly decline to claim that \texttt{cube3d-sponge} is secure. It is
+merely \emph{not obviously broken}, which is a far weaker statement, and we recommend
+Ascon or ChaCha20-Poly1305 for any real use.
+\end{abstract}
+
+\tableofcontents
+
+\section{Introduction}
+
+\subsection{The question}
+
+Cellular automata are seductive to cryptographers. They are local, parallel, cheap in
+hardware, and they generate visually chaotic output from trivially simple rules. It
+is tempting --- and the literature shows it has been tempting for forty years --- to
+read that visual chaos as cryptographic strength.
+
+This work began with a concrete proposal in that tradition: given prior work
+analysing data plotted as two-dimensional grids under CA evolution, would folding
+data into a \emph{three-dimensional} grid --- a central cube surrounded by concentric
+shells of smaller cubes, with the CA radiating outward in all directions --- make the
+technique ``way more complex and hence more secure''?
+
+The question deserves a precise answer, because the reasoning inside it is the single
+most common failure mode in the CA- and chaos-cryptography literature. The answer has
+three parts:
+
+\begin{enumerate}
+  \item \textbf{No, not as stated.} Complexity is not security. Security is the
+    analysed work factor for an adversary who knows the entire construction and lacks
+    only the key (Kerckhoffs~\cite{kerckhoffs}). Adding dimensions, shells, or radius
+    adds state and cost; it does not add any of the properties that actually resist
+    cryptanalysis. A larger linear system is still solved by Gaussian elimination.
+  \item \textbf{But the shape is right.} A 3D local nonlinear permutation iterated
+    with round constants is, almost exactly, Keccak~\cite{keccak}. Keccak's state
+    \emph{is} a $5\times5\times64$ cube of bits. The difference between Keccak and a
+    naive radiating CA is a small, enumerable set of properties --- not the geometry.
+  \item \textbf{And one piece of the geometry earns its keep.} Concentric shells are
+    a natural \emph{rate/capacity boundary}: outer shell public, inner shells never
+    directly output. That is the sponge construction~\cite{spongeindiff}, and it is a
+    legitimate, analysed structural role for ``layers.''
+\end{enumerate}
+
+\subsection{What we did}
+
+We built the construction that (3) suggests, and then we attacked it. The point was
+never to produce a competitive cipher --- we say plainly in
+Section~\ref{sec:limitations} that nobody should use this --- but to find out what a
+disciplined cryptanalytic process reports about a design whose provenance is
+``geometric intuition, corrected.''
+
+Specifically, we contribute:
+
+\begin{itemize}
+  \item \textbf{A design} (Section~\ref{sec:design}) that isolates the geometric idea
+    from the security-relevant machinery: concentric shells serve \emph{only} as the
+    rate/capacity split, while diffusion uniformity is handled independently by
+    toroidal wrapping. Conflating those two roles --- which the original ``radiate
+    from the centre'' framing does --- makes shell boundaries simultaneously diffusion
+    weak points and security boundaries.
+  \item \textbf{A cryptanalytic ladder} (Section~\ref{sec:results}) from four
+    independent harnesses: avalanche/diffusion, statistical differential and linear
+    distinguishers, a cube attack with real key recovery, and provable algebraic
+    degree bounds yielding deterministic zero-sums.
+  \item \textbf{A record of the bugs} (Sections~\ref{sec:bugs} and~\ref{sec:harnessbugs}),
+    both in the design and in the harnesses. We consider this the most transferable
+    part of the paper. Every one of the four was caught by a measurement that produced
+    a \emph{physically impossible} number, not by inspection.
+  \item \textbf{An explicit refusal to overclaim.} Upper bounds on degree prove that
+    distinguishers exist; they never prove that they do not. Negative attack results
+    mean ``this attack, at this budget, found nothing.''
+\end{itemize}
+
+\subsection{A note on a corrected novelty claim}
+\label{sec:novelty}
+
+Early in this work we believed the concentric-cube geometry to be structurally novel.
+A literature search conducted for this paper shows that belief was too strong, and we
+correct it here rather than quietly dropping it. Martín del Rey~\cite{rey2015}
+encrypts 3D solid objects using a three-dimensional chaotic Cat map for confusion
+followed by a \emph{second-order memory reversible 3D cellular automaton} for
+diffusion, iterated over several rounds --- which is, almost point for point, the
+architecture we independently proposed as the ``principled path.'' 3D CA image and
+object encryption is an established sub-literature~\cite{rey2015,chen2004,3dca2016,carev2026}.
+What remains arguably new in our construction is narrower: the checkerboard Feistel
+over a 3-torus as an invertibility mechanism, and the use of concentric shells
+specifically as a sponge rate/capacity boundary rather than as a diffusion structure.
+We make no strong novelty claim beyond that, and we note that novelty of geometry
+would not, in any case, imply novelty of security argument.
+
+\section{Related work}
+\label{sec:related}
+
+\subsection{Cellular-automaton cryptography and its cryptanalytic record}
+
+Wolfram proposed elementary CA rule~30 as the basis of a Vernam-like stream cipher at
+CRYPTO~1985~\cite{wolfram85}, motivated by its Class~III chaotic dynamics: the key is
+the initial configuration of a ring of cells, and the sequence of states of a
+distinguished cell is the keystream. Meier and Staffelbach broke it at
+EUROCRYPT~1991~\cite{meier91} with a correlation attack that reconstructs the seed
+despite the sequence passing classical statistical randomness tests. This is the
+canonical lesson of the field, and it is worth stating in its strongest form:
+\emph{passing statistical tests is not evidence of cryptographic strength}. Rule~30
+passed; rule~30 fell.
+
+Subsequent work has attempted to repair the approach --- by enlarging the
+neighbourhood radius~\cite{4nbr}, by using maximum-period nonlinear
+CA~\cite{maiti17}, by hybridising linear and nonlinear rules --- with mixed and often
+short-lived success. Mariot and Leporati's recent survey~\cite{camariot} of a decade
+of CA-based cryptography is candid about the field's methodological problems, noting
+in particular that most work relies on ad~hoc arguments specific to individual rules
+that generalise poorly.
+
+It is worth recording the one unambiguous success story: the $\chi$ mapping, a
+degree-2 shift-invariant nonlinear CA-like transformation introduced by Daemen et
+al.~\cite{daemen94}, is the nonlinear core of Keccak~\cite{keccak} and, in affine
+equivalent form, of Ascon~\cite{asconspec}. CA ideas did produce a
+standards-grade primitive --- but as \emph{one layer} inside a carefully analysed
+round function, never as the whole cipher.
+
+\subsection{The chaos/CA image-encryption literature}
+
+The proximate context for the original question is the large literature on
+chaos- and CA-based image encryption. Its architectural template is due to
+Fridrich~\cite{fridrich98}: a permutation (confusion) stage scrambles pixel
+\emph{positions} using a 2D or 3D chaotic map, followed by a diffusion stage that
+modifies pixel \emph{values}, with the pair iterated for several rounds. This
+directly instantiates Shannon's confusion/diffusion principle~\cite{shannon49}.
+
+The cryptanalytic record of this literature is poor, and it is important to state so
+plainly because sheer publication volume can be mistaken for validation. Fridrich's
+own founding scheme was cryptanalysed by Solak et al.~\cite{solak10}, with an attack
+that extends to structurally similar designs including the widely-cited 3D chaotic
+Cat map scheme of Chen et al.~\cite{chen2004}. Li and collaborators have broken a
+long series of such schemes~\cite{li09compound,li11breaking,li18ieaie,limodified},
+frequently with a handful of chosen plaintexts. Most damningly, Li, Chen and
+Lo~\cite{lipermonly} give a \emph{generic} result: all permutation-only multimedia
+ciphers are practically insecure against known/chosen-plaintext attack, requiring only
+$O(\log_L(MN))$ plaintexts to recover at least half of a plaintext of size $M\times N$
+with $L$ value levels.
+
+Two conclusions follow, both directly relevant to the question this paper answers.
+First, ``cascading more chaotic maps / more CA layers'' does not compose weak
+primitives into a strong one. Second --- and this is the specific trap in the original
+proposal --- a \emph{fixed, public} folding of data into a grid is a known permutation,
+and a known permutation contributes exactly zero entropy.
+
+\subsection{Three-dimensional CA cryptography}
+
+Prior 3D CA cryptography exists and is not marginal. Beyond
+Rey~\cite{rey2015} discussed in Section~\ref{sec:novelty}, there is work rendering
+images into 3D lattices with chaotic Cat map confusion and 3D CA
+diffusion~\cite{3dca2016}, 3D image encryption via integral imaging and CA
+transforms, and a 2026 review covering 1D, 2D and 3D CA image encryption
+comprehensively~\cite{carev2026}. The recurring pattern is that the third dimension is
+used as \emph{extra scrambling volume}. We are not aware of prior work using
+concentric shells of a 3D CA state as a sponge rate/capacity boundary, which is the
+one structural element we would defend as new --- while noting again that structural
+novelty is not a security argument.
+
+\subsection{Sponge constructions}
+
+The sponge construction~\cite{spongeindiff} maintains a state split into a
+\emph{rate} $r$ (absorbed into and squeezed from) and a \emph{capacity} $c$ (never
+touched directly by the outside world), with $b = r + c$. Security against generic
+attacks is governed by $c$, not $b$. Keccak~\cite{keccak}, standardised as
+SHA-3~\cite{fips202}, instantiates this with a $b = 1600$-bit permutation whose state
+is a $5\times5\times64$ array of bits, and whose round is
+$\iota\circ\chi\circ\pi\circ\rho\circ\theta$. Ascon~\cite{asconspec}, selected by NIST
+for lightweight cryptography and specified in SP~800-232~\cite{sp800232}, uses a
+320-bit sponge/duplex with a 5-bit S-box that is an affine equivalent of Keccak's
+$\chi$, applying 12 rounds for initialisation/finalisation and 8 for the data path.
+
+The relevance to the original question is direct. Keccak is a three-dimensional,
+local, nonlinear, iterated permutation --- the intuition ``operate a 3D local rule
+repeatedly on a cube of data'' is not wrong, it is \emph{already standardised}. What
+separates Keccak from a naive radiating CA is a short list: a nonlinear step ($\chi$),
+a symmetry-breaking round constant ($\iota$), a bit-transposition step ($\rho$, $\pi$)
+and a linear diffusion step ($\theta$) --- plus, decisively, a decade of adversarial
+analysis.
+
+\subsection{Cryptanalytic tools}
+
+\paragraph{Cube attacks.} Dinur and Shamir~\cite{cube09} observe that any output bit
+of a keyed primitive is a polynomial over $\FF_2$ in key and public (IV/nonce)
+variables. Summing the output over all $2^d$ assignments of a chosen $d$-subset $I$ of
+public variables (the \emph{cube}) annihilates every monomial not divisible by the
+cube monomial $t_I$, leaving the \emph{superpoly} $p_{S(I)}$. If the total degree is
+at most $d+1$, the superpoly is linear in the key bits, yielding a free linear
+equation. Enough independent linear superpolys recover the key by Gaussian
+elimination. Linearity is tested probabilistically by the Blum--Luby--Rubinfeld
+test~\cite{blr}: a linear $p$ satisfies $p(x)\oplus p(y)\oplus p(0) = p(x\oplus y)$.
+Cube testers~\cite{cubetesters} extend the idea to distinguishers.
+
+\paragraph{Division property.} Todo~\cite{todo15} introduced the division property as
+a generalised integral property; Todo and Morii~\cite{todo16} refined it to the
+bit-based division property (BDP). Xiang et al.~\cite{xiang16} made it practical at
+realistic block sizes by modelling division-trail propagation as Mixed Integer Linear
+Programming, solved with off-the-shelf solvers. Division property gives the current
+state of the art in \emph{provable} degree upper bounds and zero-sum
+distinguishers, and Hu et al.'s monomial-prediction
+formulation~\cite{hu20} makes degree evaluation exact.
+
+\paragraph{Numeric mapping.} Liu~\cite{liu17} introduced numeric mapping, a cheap
+degree-propagation technique for NFSR-based cryptosystems. It propagates per-bit
+degree upper bounds through $\deg(a\oplus b)\le\max(\deg a,\deg b)$ and
+$\deg(a\wedge b)\le \deg a + \deg b$. It is sound but loose. Zhang et
+al.~\cite{zhang21} compare Boura--Canteaut's formula~\cite{boura11}, Carlet's formula,
+Liu's numeric mapping and Todo's division property, proving division property is never
+worse than the first two. Hu et al.~\cite{hu20} quantify the gap dramatically: the
+exact degree of 834-round Trivium is 78, whereas Liu's numeric mapping bound already
+reaches 79 at 793 rounds. We use numeric mapping in this work, and
+Section~\ref{sec:limitations} is explicit that this is a tractability compromise, not
+a choice of the best tool.
+
+\paragraph{Degree bounds.} Canteaut and Videau~\cite{canteaut02} bound the degree of a
+composition; Boura, Canteaut and De Cannière~\cite{boura11} give bounds specialised to
+Keccak-like permutations that are tighter than the naive $(\deg F)^R$ near saturation.
+
+\section{Design of \texttt{cube3d-sponge}}
+\label{sec:design}
+
+\subsection{State geometry}
+
+The state is an $8\times8\times8$ array of bytes: $512$ cells, $4096$ bits. Cell
+$(x,y,z)$ has index $i = x + 8y + 64z$.
+
+\paragraph{Why $N=8$ and not $7$.} Our first implementation used $N=7$ to obtain a
+single centre cell, matching the ``central cube'' of the original proposal literally.
+This is \emph{mathematically broken}, and the unit test caught it immediately. The
+round function (below) requires a checkerboard 2-colouring by the parity of $x+y+z$
+such that every face-neighbour has the opposite colour. On a torus with wrap-around,
+this holds only if the side length is even: an odd-length cycle is not bipartite. With
+$N=7$, cells at $x=0$ and $x=6$ are wrap-around neighbours and share a colour,
+silently invalidating the Feistel invertibility argument. With $N=8$ the colouring is
+consistent, and as a bonus the centre is a literal $2\times2\times2$ cube of 8 cells
+--- closer to the original geometric picture than a single point.
+
+\paragraph{Shells.} Since $N$ is even there is no single centre coordinate, only a
+centre \emph{pair} $\{3,4\}$ per axis. Define the per-axis shell
+$s(v) = \min(|v-3|,|v-4|)$ and the cell shell
+$\operatorname{rad}(i) = \max(s(x),s(y),s(z)) \in \{0,1,2,3\}$. Shell~0 is the central
+$2\times2\times2$ cube; shell~3 is the outer face shell.
+
+\paragraph{Rate and capacity.} The outer shell ($\operatorname{rad} = 3$, 296 cells) is
+the sponge \textbf{rate}: the only cells \texttt{absorb} and \texttt{squeeze} ever
+touch. Shells 0--2 (216 cells, 1728 bits) are the \textbf{capacity}: never read or
+written directly. This is the legitimate role of ``concentric layers'' promised in
+Section~1.
+
+\paragraph{Colouring.} $\operatorname{col}(i) = (x+y+z) \bmod 2$. On the even torus,
+every face-neighbour of a cell has the opposite colour.
+
+\subsection{Round function}
+
+One round is $\pi \circ \rho \circ \mathrm{Feistel}$. Each step is individually
+invertible, so the composition is a permutation by construction.
+
+\paragraph{$\chi_3$: the nonlinear step.} For cell $i$ with toroidal face-neighbours
+$(n_0,\dots,n_5)$ and round $r$, let $j_k = n_{(k + 2(r \bmod 3)) \bmod 6}$. Then
+\[
+\chi_3(S,i,r) \;=\; (\lnot S_{j_0} \wedge S_{j_1}) \oplus
+                   (\lnot S_{j_2} \wedge S_{j_3}) \oplus
+                   (\lnot S_{j_4} \wedge S_{j_5}),
+\]
+computed bytewise. This is in the $\chi$ family of Daemen et al.~\cite{daemen94}: it
+has algebraic degree 2, and it is the only source of nonlinearity in the design.
+Neighbours are \emph{toroidal}, which gives every cell an identical neighbourhood
+shape; without wrapping, shell-boundary cells would diffuse differently from interior
+cells, which is precisely the anisotropy the original ``radiate outward'' framing
+would have introduced.
+
+\paragraph{Feistel: the invertibility mechanism.} Because every face-neighbour of an
+$A$-cell is a $B$-cell, $\chi_3$ evaluated at an $A$-cell reads \emph{only} $B$-cells.
+This is exactly the condition a Feistel network needs. With $A_0, B_0$ the colour
+classes of the input state:
+\begin{align}
+  A_1[i] &= A_0[i] \oplus \chi_3(B_0, i, r), &&\text{for all $A$-cells } i,\\
+  A_1'   &= A_1 \text{ with } \mathrm{RC}(r) \text{ XORed into cell } 0, \\
+  B_1[i] &= B_0[i] \oplus \chi_3(A_1', i, r), &&\text{for all $B$-cells } i.
+\end{align}
+\begin{proposition}[Invertibility]
+The Feistel step is a bijection for \emph{any} function $\chi_3$ whatsoever, provided
+$\chi_3$ evaluated at a cell of one colour reads only cells of the other colour.
+\end{proposition}
+\begin{proof}
+Given $(A_1', B_1)$, recover $B_0[i] = B_1[i] \oplus \chi_3(A_1', i, r)$ (which needs
+only $A_1'$, available); then $A_1 = A_1'$ with $\mathrm{RC}(r)$ XORed out; then
+$A_0[i] = A_1[i] \oplus \chi_3(B_0, i, r)$ (which needs only $B_0$, now recovered).
+\end{proof}
+This is why we chose a Feistel over a second-order or Margolus partitioning CA: it
+decouples the invertibility argument entirely from the choice of nonlinear rule,
+letting us make $\chi_3$ as nonlinear as we like without ever endangering decryption.
+
+\paragraph{$\iota$-analogue: round constants.} $\mathrm{RC}(r)$ is a cheap
+integer-hash of the round index, XORed into cell 0 only (as Keccak's $\iota$ touches
+one lane). It is load-bearing, not decorative: the $\chi_3$ tap rotation has period 3
+in $r$, so \emph{without} the constant, round 0 and round 3 are literally the same
+function --- a textbook slide-attack foothold. Our \texttt{slide\_test} harness
+verifies exactly this (Section~\ref{sec:res-slide}). Note also that any constant state
+$S_i = c$ satisfies $\chi_3(S) = 0$, since $\lnot c \wedge c = 0$; without the round
+constant, all 256 constant states would be fixed points of the Feistel.
+
+\paragraph{$\rho$: bit-plane coupling.} Rotate each cell's byte left by
+$\rho(i) = (x + 3y + 5z) \bmod 8$. Section~\ref{sec:bugs} explains why this step is
+the single most important component in the design.
+
+\paragraph{$\pi$: transposition.} A coordinate shear mod 8:
+\[
+  x' = x + y,\quad y' = y + z,\quad z' = z + x' \pmod 8.
+\]
+The system is triangular, so the inverse is immediate: $z = z' - x'$, $y = y' - z$,
+$x = x' - y$. No lookup table is needed, and bijectivity is verified by unit test
+rather than asserted. $\pi$ deliberately moves cells \emph{across} shells; the
+rate/capacity split is positional, exactly as Keccak's rate is ``the first $r$ bits''
+while $\pi$ shuffles bits through those positions.
+
+\subsection{Mode}
+
+\texttt{Sponge::absorb} XORs up to 296 bytes into the rate cells and applies
+$\mathrm{permute} = $ 12 rounds; \texttt{squeeze} reads rate cells and permutes as
+needed. \texttt{keystream(key, nonce)} absorbs the key, permutes, absorbs the nonce,
+permutes, and squeezes. \emph{There is no authentication tag.} This is a keystream
+generator only, and Section~\ref{sec:limitations} says what to do about that (namely:
+do not use it).
+
+\section{Two design bugs, and how they were caught}
+\label{sec:bugs}
+
+Both bugs below were caught by measurements returning \emph{impossible} numbers, not
+by code review. We report them because they are the most transferable content here.
+
+\subsection{The odd-torus colouring}
+
+Discussed in Section~\ref{sec:design}: with $N=7$, the unit test
+\texttt{checkerboard\_neighbors\_always\_opposite\_colour} failed instantly. Had we
+merely eyeballed the design, the invertibility proof would have been silently false
+for wrap-around neighbours.
+
+\subsection{Bit-plane independence: the $6.25\%$ plateau}
+\label{sec:planebug}
+
+Our first design had $\chi_3$ and the Feistel but \emph{no} $\rho$. Avalanche
+measurement showed the state difference from a single flipped input bit stuck at
+$\approx 6.3\%$ and \emph{perfectly flat} through 16 rounds --- not a slow ramp, a
+hard ceiling.
+
+The diagnosis is arithmetic. $\chi_3$ uses bitwise \texttt{AND}/\texttt{NOT}/%
+\texttt{XOR} on \texttt{u8} cells. Bitwise operations act on all 8 bits in parallel
+but \emph{independently}: bit $k$ of the output depends only on bit $k$ of the inputs.
+Without $\rho$, the ``$8\times8\times8$ cube of bytes'' was never a single 4096-bit
+state at all --- it was \textbf{eight completely independent, non-interacting 512-bit
+binary CAs stacked in the same memory}. A flipped bit could never leave its own
+bit-plane. Hence the saturation ceiling is
+\[
+  \frac{512}{2} \Big/ 4096 = 6.25\%,
+\]
+which is what we measured. Seven-eighths of the state was dead weight \emph{by
+construction}.
+
+\begin{remark}
+Our initial hypothesis was wrong, and instructively so. We first attributed the
+plateau to insufficient long-range transposition. That diagnosis is refuted by
+geometry: an 8-torus has diameter 4 per axis, and a Feistel round moves information 2
+hops, so $\chi_3$ alone floods the cube in $\approx 3$ rounds. Reach was never the
+problem. The tell was that the plateau was \emph{flat and numerically exact}: a
+diffusion-reach limitation produces a slow ramp, not a hard ceiling at a suspiciously
+round number. \textbf{When a measurement lands on an exact value, compute what that
+value would have to mean.}
+\end{remark}
+
+$\rho$ fixes it: face-adjacent cells receive different rotation offsets, so bit $k$ of
+a cell comes to depend on bit $k - \rho(j)$ of neighbour $j$, and the planes couple.
+This is precisely the job Keccak's $\rho$ does, and it is why Keccak has a $\rho$ at
+all. A regression test (\texttt{bitplanes\_are\_coupled}) now asserts that a
+single-bit difference reaches $\ge 2$ bit-planes within 4 rounds.
+
+\section{Methodology}
+\label{sec:method}
+
+All code is Rust (stable, \texttt{--release}), with geometry lookup tables cached
+behind \texttt{OnceLock}; the table optimisation is verified behaviour-preserving by
+the fact that all 10 unit tests pass unchanged. Measured cost is
+$\approx 4.1\,\mu s$ per round per permutation. Four harnesses:
+
+\begin{description}
+  \item[\texttt{avalanche}] Strict avalanche ramp from a single flipped bit, averaged
+    over 64 trials, reporting total/rate-shell/capacity-shell difference and the
+    number of bit-planes reached.
+  \item[\texttt{linearity\_test}] Superposition/affinity smoke test: for affine $L$,
+    $L(a)\oplus L(b)\oplus L(0)\oplus L(a\oplus b) = 0$ identically.
+  \item[\texttt{slide\_test}] Verifies the round constant breaks the period-3
+    self-similarity of the tap rotation.
+  \item[\texttt{distinguish}] Statistical distinguishers against the sponge's
+    fixed-capacity slice: per-bit bias, single-bit differential propagation, and
+    random small-weight linear approximations, reported as $z$-scores.
+  \item[\texttt{attack}] Cube attack with genuine key recovery: dependency-cone
+    measurement, superpoly extraction, BLR linearity testing, GF(2) Gaussian
+    elimination, verified against the real key.
+  \item[\texttt{degree}] Numeric-mapping degree bounds, soundness cross-check, and
+    deterministic zero-sum search.
+\end{description}
+
+\subsection{The attacked variant, and why the weakening is sound}
+\label{sec:variant}
+
+\texttt{attack} and \texttt{degree} target a \emph{deliberately weakened} variant:
+\[
+  \text{state} = \text{key}(16\text{B}) \,\|\, \text{nonce}(64\text{B}) \,\|\,
+  \text{capacity}(0) \;\to\; \mathrm{permute}_R \;\to\; \text{read rate},
+\]
+whereas the shipped \texttt{keystream()} places a \emph{full} permutation between the
+key absorb and the nonce absorb, so the attacker's nonce never meets the raw key. The
+variant is the standard Ascon/Keccak ``init'' model and is strictly easier to attack.
+
+This direction of weakening is what makes the argument sound. An attack that dies at
+round $R$ against the weaker variant implies the shipped construction survives
+\emph{at least} $R$ rounds: a lower bound on the real thing's security, which is the
+useful direction for a defender. Claiming a \emph{strong} result from a weakened
+variant would be illegitimate; claiming the conservative one is not.
+
+\subsection{An important non-experiment}
+
+We do not test ``is any output bit of $\mathrm{permute}$ biased'' on the full state.
+$\mathrm{permute}$ is a bijection on $\FF_2^{4096}$, so uniform input yields exactly
+uniform output by definition; any measured bias is sampling noise. The meaningful
+question is the one an attacker faces --- the pushforward through the sponge's
+\emph{fixed-capacity slice}, which is not guaranteed uniform. All distinguishers
+target that slice.
+
+\section{Two harness bugs, and how they were caught}
+\label{sec:harnessbugs}
+
+\subsection{Non-monotonic degree}
+
+Our first \texttt{attack} reported estimated degrees of $0, 1, 0, 4$ for rounds
+$1..4$. Degree cannot decrease with rounds under the naive bound, so this was
+impossible on its face. Cause: we drew random cubes from 2240 nonce bits and random
+output bits. At low rounds the permutation is \emph{local}, so almost every cube sat
+entirely outside the output bit's dependency cone. The sums were zero because those
+nonce bits do not influence that output bit \emph{at all} --- we were measuring ``did I
+hit the cone,'' not degree. Fix: measure the cones first, and draw cubes only from a
+target bit's own nonce-influence set.
+
+\subsection{Sampling a sparse target set}
+
+The corrected harness then reported ``no target'' at round 1. Cause: we sampled 24
+of 2368 output bits, and at round 1 only $\approx 4\%$ of output bits have \emph{any}
+key bit in their cone. Fix: full scan at rounds 1--2 (with the cheaper key-cone test
+as a filter before the nonce-cone test), sampling only at rounds $\ge 3$ where cones
+have saturated. This is what turned rank 0 into actual recovered key bits.
+
+\section{Results}
+\label{sec:results}
+
+All results reproduced on Linux (Ubuntu, container) and Windows 11 (PowerShell 7.6.3)
+with different random seeds and secret keys, with agreement to within sampling noise.
+
+\subsection{Correctness}
+
+All 10 unit tests pass: per-round and full-permutation invertibility, $\rho$/$\pi$
+round-trips, $\pi$ bijectivity ($|\{\pi(i)\}| = 512$), $\pi^{-1}\circ\pi = \mathrm{id}$,
+stream-cipher round-trip, shell partition sizes ($296 + 216 = 512$), checkerboard
+neighbour colouring, and bit-plane coupling.
+
+\subsection{Avalanche}
+
+\begin{table}[h]
+\centering
+\caption{Single-bit avalanche ramp, mean over 64 trials. The bit-plane column is the
+diagnostic for the bug of Section~\ref{sec:planebug}.}
+\begin{tabular}{rrrrr}
+\toprule
+Rounds & Total diff & Rate shell & Capacity shell & Bit-planes hit (of 8) \\
+\midrule
+0 &  0.02\% &  0.03\% &  0.02\% & 1.00 \\
+1 &  0.16\% &  0.17\% &  0.15\% & 4.70 \\
+2 &  1.08\% &  1.04\% &  1.13\% & 7.84 \\
+3 &  5.94\% &  5.94\% &  5.94\% & 8.00 \\
+4 & 23.14\% & 23.21\% & 23.05\% & 8.00 \\
+5 & 44.55\% & 44.61\% & 44.48\% & 8.00 \\
+6 & 49.75\% & 49.93\% & 49.51\% & 8.00 \\
+7 & 50.00\% & 49.95\% & 50.07\% & 8.00 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Full avalanche is reached at round 6--7, so $\mathrm{ROUNDS} = 12$ provides roughly a
+$2\times$ margin on this metric. Note that $5.94\%$ at round 3 is now a mere waypoint;
+in the pre-$\rho$ design it was the permanent ceiling. Critically, the
+\textbf{capacity shell tracks the rate shell within noise} ($49.51\%$ vs $49.93\%$ at
+round 6), with no permanent lag: the concentric-shell rate/capacity split is doing
+real work rather than serving as decoration.
+
+\subsection{Affinity smoke test}
+
+Residual weights (out of 4096 bits) over 200 trials per round count, at rounds
+$1,2,4,8,12$: minimum $1952$--$1975$, mean $2029.6$--$2050.2$, i.e.\ pinned at
+$\approx 50\%$ from round 1 onward. No trial ever produced an exact affine relation.
+This is a \emph{necessary, not sufficient} check; it would fail loudly on a
+catastrophically linear design and says nothing about algebraic degree.
+
+\subsection{Slide symmetry}
+\label{sec:res-slide}
+
+With round constants disabled, rounds 0 and 3 produce identical output on identical
+input (\texttt{true}); with constants enabled, they do not (\texttt{false}).
+Confirmed: the tap rotation alone yields a period-3 self-similar round function, and
+the round constant is exactly what breaks it.
+
+\subsection{Statistical distinguishers}
+
+The strongest signal was single-bit differential propagation (input bit 0 flipped,
+20{,}000 trials, worst output bit reported):
+
+\begin{table}[h]
+\centering
+\caption{Differential propagation against the fixed-capacity slice. $z$ is deviation
+from a 50\% flip probability.}
+\begin{tabular}{rrrl}
+\toprule
+Rounds & Worst out-bit & $z$-score & Flip probability \\
+\midrule
+1--3 & --- & $\pm141.42$ & $\approx 0\%$ or $100\%$ (deterministic) \\
+4 & 12 & $-141.42$ & $\approx 0\%$ (deterministic) \\
+5 & 1798 & $-105.57$ & $\approx 12.7\%$ \\
+6 & 451 & $-18.38$ & $\approx 43.5\%$ \\
+7 & 183 & $-3.90$ & $\approx 48.6\%$ \\
+8 & 74 & $-3.54$ & $\approx 48.75\%$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Round 5 is trivially distinguishable. Round 6 is a real but small effect --- $z=-18$
+is not ``maybe.'' By round 7 it is at the noise floor. This independently corroborates
+the avalanche result (full mixing at 6--7) from a different measurement, which is the
+kind of internal consistency one wants before trusting either.
+
+\subsection{Cube attack: key recovery}
+
+\begin{table}[h]
+\centering
+\caption{Dependency cones. Full scan of all 2368 output bits at rounds 1--2; sampling
+thereafter.}
+\begin{tabular}{rlrrr}
+\toprule
+Rounds & Scan & Out-bits with key cone & Mean $|$key cone$|$ & Mean $|$nonce cone$|$ \\
+\midrule
+1 & full   & 253 of 2368 & 3.3   & 2.6 \\
+2 & full   & 939 of 2368 & 6.5   & 9.3 \\
+3 & sample & 39 of 48    & 24.3  & 98.2 \\
+4 & sample & 48 of 48    & 80.5  & 332.6 \\
+5 & sample & 48 of 48    & 122.4 & 491.5 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Cube attack key recovery against a 128-bit key. Ranges are across four runs
+with different secret keys and seeds; cube selection is randomised, so R=2 succeeds in
+roughly half of runs. Every ``bits pinned'' figure was verified correct against the
+real key.}
+\begin{tabular}{rrrrl}
+\toprule
+Rounds & Linear superpolys & Rank & Keyspace & Key bits pinned \& verified \\
+\midrule
+1 & 3--9 & 2--5 & $2^{123}$--$2^{126}$ & 1--4 (all correct) \\
+2 & 0--2 & 0--2 & $2^{126}$--$2^{128}$ & 0--2 (all correct) \\
+3 & 0 & 0 & $2^{128}$ & --- \\
+4 & 0 & 0 & $2^{128}$ & --- \\
+5 & 0 & 0 & $2^{128}$ & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Key recovery works reliably at round 1, intermittently at round 2, and never at round
+3 or beyond. The cone table explains the mechanism precisely: a $d$-dimensional cube
+linearises degree $\approx d+1$, and degree grows $\approx 4^R$. At round 1 the cone
+is $\approx 3$ bits and degree $\le 4$, so a $d=3$ cube linearises trivially. By round
+3 degree is $\approx 64$, demanding $2^{64}$ work per superpoly. The attack does not
+fail because we gave up; it fails because $2^d$ outruns any budget the moment the cone
+opens.
+
+\subsection{Provable degree bounds and zero-sums}
+
+Numeric mapping was cross-validated for soundness before use: the bound claims 1336
+output bits have degree 0 at round 1 (i.e.\ provably do not depend on \emph{any} nonce
+bit). We sampled 120 such predictions and hammered them with random nonces:
+\textbf{0 violations}. Had even one moved, every number below would be worthless.
+
+\begin{table}[h]
+\centering
+\caption{Numeric-mapping degree bounds, all 512 nonce bits active. The bound is sound
+(an over-approximation) and beats the naive $4^R$ bound at round 4.}
+\begin{tabular}{rrrrr}
+\toprule
+Rounds & Naive $4^R$ & Proven bound (max) & Median & Out-bits proven degree 0 \\
+\midrule
+1 & 4   & 4   & 0   & 1336 of 2368 \\
+2 & 16  & 16  & 3   & 176 of 2368 \\
+3 & 64  & 62  & 19  & 0 \\
+4 & 256 & \textbf{151} & 114 & 0 \\
+5 & 512 & 512 (sat.) & 512 & 0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{proposition}[Zero-sum]
+If output bit $o$ has provable degree $< d$ in a set of $d$ cube variables, then
+summing $o$ over all $2^d$ assignments of that cube is $0$ --- for every key, always.
+\end{proposition}
+\begin{proof}
+Every monomial of degree $< d$ omits at least one cube variable; summing over both
+values of an omitted variable cancels the monomial in pairs.
+\end{proof}
+
+This is a \emph{deterministic} distinguisher: no statistics, no $z$-score. We verified
+sampled claims empirically and every predicted sum was indeed zero --- theory and
+measurement agreeing.
+
+\begin{table}[h]
+\centering
+\caption{Cube \emph{shape} sweep. Entries are output bits with a provable zero-sum.
+$0$ means the bound was not tight enough to prove one, not that none exists.}
+\label{tab:shapes}
+\begin{tabular}{lrrrrrr}
+\toprule
+Shape & $d$ & Cost & $R{=}4$ & $R{=}5$ & $R{=}6$ & $R{=}7$ \\
+\midrule
+1 cell, all 8 planes    &  8 & $2^{8}$  & 2088 & 0 & 0 & 0 \\
+2 cells adjacent        & 16 & $2^{16}$ & 2360 & 0 & 0 & 0 \\
+4 cells adjacent        & 32 & $2^{32}$ & 2368 & 0 & 0 & 0 \\
+8 cells adjacent        & 64 & $2^{64}$ & 2368 & \textbf{136} & 0 & 0 \\
+1 plane across 16 cells & 16 & $2^{16}$ & 924  & 0 & 0 & 0 \\
+1 plane across 32 cells & 32 & $2^{32}$ & 1580 & 0 & 0 & 0 \\
+2 planes $\times$ 12 cells & 24 & $2^{24}$ & 1335 & 0 & 0 & 0 \\
+Spread, stride-37       & 24 & $2^{24}$ & 1230 & 0 & 0 & 0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Cube \emph{shape} matters more than dimension. Compare ``1 plane across 16 cells''
+(924 zero-sums) with ``2 cells adjacent'' (2360) --- identical $d = 16$, a
+$2.5\times$ difference in reach. The mechanism follows directly from
+Section~\ref{sec:planebug}: $\chi_3$ is bitwise, so bit $k$ only meets bit $k$ of its
+neighbours, and $\rho$ is the sole coupling between planes. A cube stacked into few
+cells therefore grows degree \emph{slower} than one spread across many, and slower
+growth means deeper zero-sums. The $d=64$ cube reaches round 5 at $2^{64}$ work:
+unverifiable in practice, but $2^{64} \ll 2^{128}$, so it is a legitimate
+distinguisher --- proven by propagation rather than measured.
+
+\section{Discussion}
+
+\subsection{The ladder}
+
+\begin{table}[h]
+\centering
+\caption{Complete cryptanalytic ladder against \texttt{cube3d-sponge} (12 rounds).}
+\begin{tabular}{lcl}
+\toprule
+Result & Reach & Nature \\
+\midrule
+Key recovery (cube attack)              & 2 & Verified against real key \\
+Provable zero-sum, practical ($\le 2^{16}$) & 4 & Deterministic + empirically confirmed \\
+Provable zero-sum, $\le 2^{64}$ cube    & 5 & Deterministic, proof-only \\
+Statistical differential bias           & 6 & $z = -18$; evidence, not proof \\
+\midrule
+\textbf{Design}                         & \textbf{12} & $\approx 2\times$ margin over the best distinguisher \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The four-round gap between key recovery (2) and distinguishing (6) is not an anomaly
+--- it is the expected shape. Distinguishers always reach further than key recovery,
+which is why ``I found a bias at round 5'' never implies ``the key falls at round 5.''
+
+\subsection{Calibration against Ascon}
+
+The single most useful calibration point is Ascon's own third-party analysis
+table~\cite{asconupdate}, which reports a \textbf{zero-sum distinguisher on the full
+12/12-round permutation at $2^{55}$}, an 8/12 integral at $2^{46}$, and 5/12
+truncated-differential and rectangle distinguishers. Ascon is nonetheless a NIST
+standard~\cite{sp800232}.
+
+The lesson is important and cuts against alarmism: \emph{distinguishers on the
+permutation do not break the mode}. A zero-sum on the bare permutation says nothing
+directly about the AEAD's confidentiality, because the mode never gives the attacker
+the freedom the distinguisher assumes. By that yardstick, our round-4/5 zero-sums on a
+12-round permutation are unremarkable --- Ascon has one at 12/12. What would be
+alarming is a \emph{key recovery} near full rounds, and ours dies at 2.
+
+\subsection{What the geometry was worth}
+
+Three specific findings bear on the original question.
+
+\begin{enumerate}
+  \item \textbf{Concentric shells as rate/capacity: validated.} The capacity shell
+    tracks the rate shell within noise. The split does real work.
+  \item \textbf{Radiating outward as diffusion: refuted before it was built.} Toroidal
+    wrapping, not radial structure, is what gives uniform neighbourhoods. Decoupling
+    the diffusion geometry from the security boundary was necessary; the original
+    proposal fused them.
+  \item \textbf{More shells for ``more complexity'': no effect, and mildly harmful.}
+    Extra shells add state and cost, add no nonlinearity, and (without wrapping) add
+    neighbourhood classes and hence anisotropy.
+\end{enumerate}
+
+The deeper point is that \emph{every} security-relevant property in the final design
+came from the correction list --- nonlinearity ($\chi_3$), invertibility (Feistel),
+symmetry-breaking ($\iota$), plane coupling ($\rho$), transposition ($\pi$) --- and
+none from the geometry. The cube is plumbing. Good plumbing, but plumbing.
+
+\section{Limitations}
+\label{sec:limitations}
+
+We state these bluntly because the failure mode of this genre is confident
+under-qualification.
+
+\begin{enumerate}
+  \item \textbf{This is not a secure cipher and must not be used.} There is no
+    authentication tag; it is a keystream generator. Use Ascon~\cite{sp800232} or
+    ChaCha20-Poly1305.
+  \item \textbf{Upper bounds cannot prove security.} Degree upper bounds prove
+    distinguishers \emph{exist}; they never prove none does. Every ``0'' in
+    Table~\ref{tab:shapes} means ``this bound was not tight enough to prove a
+    zero-sum,'' not ``no zero-sum exists.''
+  \item \textbf{Numeric mapping is the wrong tool; we used it for tractability.}
+    Bit-based division property via MILP~\cite{todo16,xiang16} is strictly
+    tighter~\cite{zhang21}, but our state is 4096 bits --- $2.5\times$ Keccak's 1600
+    and $12.8\times$ Ascon's 320 --- giving $\approx 4\times10^5$ binary variables and
+    $\approx 3\times10^5$ constraints for a 5-round model, with no solver available.
+    The gap is not academic: Hu et al.~\cite{hu20} show numeric mapping's Trivium bound
+    reaches 79 at 793 rounds where the exact degree at 834 rounds is only 78. A proper
+    BDP/monomial-prediction model on real hardware could plausibly push the proven
+    reach past 5.
+  \item \textbf{Negative attack results are weak.} ``No key bits at round 3'' means
+    this attack, at these cube dimensions, with this compute, found nothing. Real cube
+    attacks use division-property degree bounds and clever cube
+    selection~\cite{todo17cube}, not random draws.
+  \item \textbf{No differential/linear trail bounds.} We have no proven bound on the
+    maximum expected differential characteristic probability, which is table stakes for
+    a real proposal.
+  \item \textbf{$\chi_3$, $\rho$, $\pi$ and RC were chosen for plausibility, not
+    optimised.} The $\rho$ offsets and the $\pi$ shear were not searched for
+    branch-number or diffusion optimality.
+  \item \textbf{No third-party analysis.} The design and all attacks share an author.
+    This is the weakest point of all.
+\end{enumerate}
+
+\section{Conclusion and future work}
+
+We set out to answer whether 3D cellular automata on folded concentric-cube grids
+would make a cryptosystem ``way more complex and hence more secure.'' The answer is
+that the second clause does not follow from the first, and that the geometric
+intuition --- while pointing at genuinely the right shape, since Keccak is a 3D local
+nonlinear permutation --- contributes nothing on its own. Security came entirely from
+a short, enumerable list of properties, every one of which had to be added
+deliberately and then \emph{measured}.
+
+The measurement is the contribution. Four harnesses, cross-validated on two operating
+systems, produce a coherent ladder: key recovery to round 2, deterministic zero-sums
+to round 4 (practical) or 5 ($2^{64}$), statistical bias to round 6, against a
+12-round design. Two design bugs and two harness bugs were caught by numbers that were
+\emph{impossible} rather than merely surprising --- a flat plateau at exactly $6.25\%$,
+and a non-monotonic degree curve. We would emphasise that pattern above any specific
+result: build the falsifier first, and when it returns an exact number, work out what
+that number would have to mean.
+
+Future work, in descending order of value: (i) a bit-based division property model
+using monomial prediction~\cite{hu20} on hardware capable of a 4096-bit state, to
+replace our sampled cones and loose bounds with provable ones; (ii) differential and
+linear trail bounds via MILP; (iii) a proper AEAD mode with a tag; (iv) optimisation
+of $\rho$/$\pi$ for measured branch number. None of this would make the design
+trustworthy without independent cryptanalysis, which remains the only thing that ever
+does.
+
+\section*{Availability}
+
+Source, all six harnesses, and the unit-test suite are available at
+\url{https://github.com/<user>/3d-ca-crypto}. Results reproduce with
+\texttt{cargo test --release} and \texttt{cargo run --release --bin <harness>}.
+
+\begin{thebibliography}{99}
+
+\bibitem{kerckhoffs} A. Kerckhoffs. La cryptographie militaire.
+\emph{Journal des sciences militaires}, IX:5--83, 1883.
+
+\bibitem{shannon49} C. E. Shannon. Communication theory of secrecy systems.
+\emph{Bell System Technical Journal}, 28(4):656--715, 1949.
+
+\bibitem{wolfram85} S. Wolfram. Cryptography with cellular automata.
+In \emph{CRYPTO 1985}, LNCS 218, pp. 429--432. Springer, 1986.
+
+\bibitem{meier91} W. Meier and O. Staffelbach. Analysis of pseudo random sequences
+generated by cellular automata. In \emph{EUROCRYPT 1991}, LNCS 547, pp. 186--199.
+Springer, 1991.
+
+\bibitem{daemen94} J. Daemen, R. Govaerts and J. Vandewalle. Invertible shift-invariant
+transformations on binary arrays. \emph{Applied Mathematics and Computation},
+62:259--277, 1994.
+
+\bibitem{camariot} L. Mariot and A. Leporati et al. Insights gained after a decade of
+cellular automata-based cryptography. arXiv:2405.02875, 2024.
+
+\bibitem{maiti17} S. Maiti, S. Ghosh and D. Roy Chowdhury. On the security of designing
+a cellular automata based stream cipher. In \emph{ACISP 2017}, LNCS 10343. Springer, 2017.
+
+\bibitem{4nbr} Investigating four neighbourhood cellular automata as better cryptographic
+primitives. 2017.
+
+\bibitem{fridrich98} J. Fridrich. Symmetric ciphers based on two-dimensional chaotic maps.
+\emph{International Journal of Bifurcation and Chaos}, 8(6):1259--1284, 1998.
+
+\bibitem{solak10} E. Solak, C. Çokal, O. T. Yildiz and T. Biyikoğlu. Cryptanalysis of
+Fridrich's chaotic image encryption. \emph{International Journal of Bifurcation and
+Chaos}, 20(5):1405--1413, 2010.
+
+\bibitem{chen2004} G. Chen, Y. Mao and C. K. Chui. A symmetric image encryption scheme
+based on 3D chaotic cat maps. \emph{Chaos, Solitons \& Fractals}, 21(3):749--761, 2004.
+
+\bibitem{lipermonly} C. Li, G. Chen and K.-T. Lo. Cryptanalysis of chaos-based image
+encryption algorithms employing different permutation-substitution designs; and
+C. Li and K.-T. Lo, Optimal quantitative cryptanalysis of permutation-only multimedia
+ciphers against plaintext attacks. \emph{Signal Processing}, 91(4):949--954, 2011.
+
+\bibitem{li09compound} C. Li, S. Li, G. Chen and W. A. Halang. Cryptanalysis of an image
+encryption scheme based on a compound chaotic sequence. \emph{Image and Vision Computing},
+27(8):1035--1039, 2009.
+
+\bibitem{li11breaking} C. Li, M. Z. Chen and K.-T. Lo. Breaking an image encryption
+algorithm based on chaos. \emph{International Journal of Bifurcation and Chaos},
+21(7):2067--2076, 2011.
+
+\bibitem{limodified} C. Li, S. Li and K.-T. Lo. Breaking a modified substitution-diffusion
+image cipher based on chaotic standard and logistic maps.
+\emph{Communications in Nonlinear Science and Numerical Simulation}, 2011.
+
+\bibitem{li18ieaie} C. Li et al. Cryptanalysis of a chaotic image encryption algorithm
+based on information entropy. \emph{IEEE Access}, 2018.
+
+\bibitem{rey2015} Á. Martín del Rey. A method to encrypt 3D solid objects based on
+three-dimensional cellular automata. In \emph{HAIS 2015}. Springer, 2015.
+
+\bibitem{3dca2016} A study on encryption using three-dimensional cellular automata.
+\emph{ScienceAsia}, 42S, 2016.
+
+\bibitem{carev2026} Image encryption with cellular automata: a comprehensive review.
+\emph{Archives of Computational Methods in Engineering}, 2026.
+
+\bibitem{spongeindiff} G. Bertoni, J. Daemen, M. Peeters and G. Van Assche. On the
+indifferentiability of the sponge construction. In \emph{EUROCRYPT 2008}, LNCS 4965,
+pp. 181--197. Springer, 2008.
+
+\bibitem{keccak} G. Bertoni, J. Daemen, M. Peeters and G. Van Assche.
+The Keccak sponge function family main document. \url{https://keccak.team}, 2011.
+
+\bibitem{fips202} NIST. FIPS 202: SHA-3 Standard: Permutation-Based Hash and
+Extendable-Output Functions. August 2015.
+
+\bibitem{asconspec} C. Dobraunig, M. Eichlseder, F. Mendel and M. Schläffer.
+Ascon v1.2: Submission to NIST Lightweight Cryptography. 2021.
+
+\bibitem{asconupdate} C. Dobraunig, M. Eichlseder, F. Mendel and M. Schläffer.
+Ascon status update (finalist round). NIST Lightweight Cryptography, 2022.
+
+\bibitem{sp800232} NIST. SP 800-232: Ascon-Based Lightweight Cryptography Standards for
+Constrained Devices. 2025.
+
+\bibitem{cube09} I. Dinur and A. Shamir. Cube attacks on tweakable black box polynomials.
+In \emph{EUROCRYPT 2009}, LNCS 5479, pp. 278--299. Springer, 2009.
+
+\bibitem{cubetesters} J.-P. Aumasson, I. Dinur, W. Meier and A. Shamir. Cube testers and
+key recovery attacks on reduced-round MD6 and Trivium. In \emph{FSE 2009}, LNCS 5665,
+pp. 1--22. Springer, 2009.
+
+\bibitem{blr} M. Blum, M. Luby and R. Rubinfeld. Self-testing/correcting with applications
+to numerical problems. \emph{Journal of Computer and System Sciences}, 47(3):549--595, 1993.
+
+\bibitem{todo15} Y. Todo. Structural evaluation by generalized integral property.
+In \emph{EUROCRYPT 2015}, LNCS 9056, pp. 287--314. Springer, 2015.
+
+\bibitem{todo16} Y. Todo and M. Morii. Bit-based division property and application to
+Simon family. In \emph{FSE 2016}, LNCS 9783, pp. 357--377. Springer, 2016.
+
+\bibitem{xiang16} Z. Xiang, W. Zhang, Z. Bao and D. Lin. Applying MILP method to searching
+integral distinguishers based on division property for 6 lightweight block ciphers.
+In \emph{ASIACRYPT 2016}, LNCS 10031, pp. 648--678. Springer, 2016.
+
+\bibitem{todo17cube} Y. Todo, T. Isobe, Y. Hao and W. Meier. Cube attacks on non-blackbox
+polynomials based on division property. In \emph{CRYPTO 2017}, LNCS 10403. Springer, 2017.
+
+\bibitem{liu17} M. Liu. Degree evaluation of NFSR-based cryptosystems.
+In \emph{CRYPTO 2017}, LNCS 10403, pp. 227--249. Springer, 2017.
+
+\bibitem{hu20} K. Hu, S. Sun, M. Wang and Q. Wang. An algebraic formulation of the division
+property: revisiting degree evaluations, cube attacks, and key-independent sums.
+In \emph{ASIACRYPT 2020}, LNCS 12491, pp. 446--476. Springer, 2020.
+
+\bibitem{zhang21} S. Zhang, X. Zeng et al. On the relationships between different methods
+for degree evaluation. \emph{IACR Transactions on Symmetric Cryptology}, 2021(1).
+
+\bibitem{boura11} C. Boura, A. Canteaut and C. De Cannière. Higher-order differential
+properties of Keccak and Luffa. In \emph{FSE 2011}, LNCS 6733, pp. 252--269. Springer, 2011.
+
+\bibitem{canteaut02} A. Canteaut and M. Videau. Degree of composition of highly nonlinear
+functions and applications to higher order differential cryptanalysis.
+In \emph{EUROCRYPT 2002}, LNCS 2332, pp. 518--533. Springer, 2002.
+
+\end{thebibliography}
+
+\end{document}
